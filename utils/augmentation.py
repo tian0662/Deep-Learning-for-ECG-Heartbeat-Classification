@@ -64,8 +64,29 @@ def add_gaussian_noise(sample: np.ndarray, config: GaussianNoiseConfig | None = 
     return sample_arr + noise.astype(sample_arr.dtype, copy=False)
 
 
+def _resample_to_length(signal: np.ndarray, target_length: int) -> np.ndarray:
+    """Resample a one-dimensional signal to a target length via linear interpolation."""
+
+    if target_length <= 0:
+        raise ValueError("target_length must be positive")
+
+    if signal.size == target_length:
+        return signal.astype(np.float32, copy=True)
+
+    if signal.size < 2:
+        # Nothing to interpolate, pad or truncate directly.
+        result = np.zeros(target_length, dtype=np.float32)
+        result[: min(target_length, signal.size)] = signal.astype(np.float32, copy=False)
+        return result
+
+    xp = np.linspace(0.0, 1.0, num=signal.size, endpoint=True, dtype=np.float32)
+    fp = signal.astype(np.float32, copy=False)
+    x_new = np.linspace(0.0, 1.0, num=target_length, endpoint=True, dtype=np.float32)
+    return np.interp(x_new, xp, fp).astype(np.float32, copy=False)
+
+
 def remove_mitbih_tail(sample: np.ndarray, config: TailTrimmingConfig | None = None) -> np.ndarray:
-    """Remove the low-activity tail that trails the PQRST complex."""
+    """Remove the low-activity tail and rescale to the original MIT-BIH span."""
 
     sample_arr = _as_float_array(sample)
     if config is None:
@@ -95,9 +116,8 @@ def remove_mitbih_tail(sample: np.ndarray, config: TailTrimmingConfig | None = N
     last_idx = significant[-1] + int(config.pad)
     cutoff = min(sample_arr.size, max(last_idx, significant[-1] + 1))
 
-    trimmed = sample_arr.copy()
-    trimmed[cutoff:] = 0.0
-    return trimmed
+    trimmed_segment = sample_arr[:cutoff]
+    return _resample_to_length(trimmed_segment, MITBIH_SAMPLE_LENGTH)
 
 
 def augment_sample(
