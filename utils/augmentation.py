@@ -1,185 +1,144 @@
-"""Utility functions for ECG data augmentation."""
+"""Utility functions for ECG data augmentation tailored to the MIT-BIH dataset."""
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Optional
+from typing import Optional
 
-import neurokit2 as nk
 import numpy as np
+
+
+MITBIH_SAMPLING_RATE = 360
+"""Nominal sampling rate (Hz) used for the MIT-BIH heartbeat segments."""
+
+MITBIH_SAMPLE_LENGTH = 187
+"""Number of samples per heartbeat segment in the Kaggle MIT-BIH dataset."""
 
 
 @dataclass
 class GaussianNoiseConfig:
-    """Configuration for Gaussian noise augmentation.
+    """Configuration for Gaussian noise augmentation of MIT-BIH beats."""
 
-    Attributes
-    ----------
-    std: float
-        Noise standard deviation. If ``relative`` is ``True`` this is interpreted
-        as a multiple of the sample's standard deviation.
-    relative: bool
-        Whether ``std`` should scale with the sample's standard deviation.
-    random_state: Optional[int]
-        Seed for the random number generator used to sample noise.
-    """
-
-    std: float = 0.01
+    std: float = 0.015
     relative: bool = True
     random_state: Optional[int] = None
 
 
+@dataclass
+class TailTrimmingConfig:
+    """Configuration for trimming the non-PQRST tail of MIT-BIH beats."""
+
+    amplitude_ratio: float = 0.08
+    """Minimum relative amplitude to keep (fraction of the smoothed max)."""
+
+    smoothing_window: int = 5
+    """Window size (in samples) for smoothing the absolute amplitude envelope."""
+
+    pad: int = 6
+    """Number of samples to retain after the last significant activity index."""
+
+
+def _as_float_array(sample: np.ndarray) -> np.ndarray:
+    array = np.asarray(sample, dtype=np.float32)
+    if array.ndim != 1:
+        raise ValueError("MIT-BIH heartbeat samples must be one-dimensional.")
+    if array.size != MITBIH_SAMPLE_LENGTH:
+        raise ValueError(
+            f"Expected MIT-BIH heartbeat length {MITBIH_SAMPLE_LENGTH}, received {array.size}."
+        )
+    return array
+
+
 def add_gaussian_noise(sample: np.ndarray, config: GaussianNoiseConfig | None = None) -> np.ndarray:
-    """Additive Gaussian noise augmentation for a single ECG sample.
+    """Inject Gaussian noise into a MIT-BIH heartbeat sample."""
 
-    Parameters
-    ----------
-    sample:
-        One-dimensional ECG sample.
-    config:
-        Optional :class:`GaussianNoiseConfig` instance controlling the noise
-        properties. By default noise with a standard deviation equal to 1% of the
-        signal standard deviation is used.
-
-    Returns
-    -------
-    numpy.ndarray
-        Augmented sample with additive Gaussian noise.
-    """
-
+    sample_arr = _as_float_array(sample)
     if config is None:
         config = GaussianNoiseConfig()
 
     rng = np.random.default_rng(seed=config.random_state)
-    scale = config.std * np.std(sample) if config.relative else config.std
-    if scale <= 0:
-        return sample.copy()
+    scale = config.std * np.std(sample_arr) if config.relative else config.std
+    if not np.isfinite(scale) or scale <= 0:
+        return sample_arr.copy()
 
-    noise = rng.normal(loc=0.0, scale=scale, size=sample.shape)
-    return sample + noise
-
-
-def _last_valid_index(values: Iterable[float]) -> Optional[int]:
-    last_valid = None
-    for value in values:
-        if not np.isnan(value):
-            last_valid = int(value)
-    return last_valid
+    noise = rng.normal(loc=0.0, scale=scale, size=sample_arr.shape)
+    return sample_arr + noise.astype(sample_arr.dtype, copy=False)
 
 
-def remove_post_pqrst_segment(
-    sample: np.ndarray,
-    sampling_rate: int,
-    delineate_method: str = "dwt",
-    peak_detection_method: str = "neurokit",
-    pad_ms: float = 40.0,
-) -> np.ndarray:
-    """Zero out the portion of the ECG sample after the final T-wave offset.
+def remove_mitbih_tail(sample: np.ndarray, config: TailTrimmingConfig | None = None) -> np.ndarray:
+    """Remove the low-activity tail that trails the PQRST complex."""
 
-    The function keeps the original signal length while removing the tail that
-    typically contains baseline drift or non-PQRST activity.
+    sample_arr = _as_float_array(sample)
+    if config is None:
+        config = TailTrimmingConfig()
 
-    Parameters
-    ----------
-    sample:
-        One-dimensional ECG sample.
-    sampling_rate:
-        Sampling frequency of ``sample`` in Hertz.
-    delineate_method:
-        Method passed to :func:`neurokit2.ecg_delineate` (``"dwt"`` by default).
-    peak_detection_method:
-        Method used in :func:`neurokit2.ecg_peaks` to detect R-peaks.
-    pad_ms:
-        Extra duration (in milliseconds) to keep after the detected T-wave
-        offset before zeroing the remainder of the sample.
+    if sample_arr.size == 0:
+        return sample_arr.copy()
 
-    Returns
-    -------
-    numpy.ndarray
-        Sample with the non-PQRST tail replaced by zeros. If delineation fails
-        the original sample is returned.
-    """
+    window = max(1, int(config.smoothing_window))
+    if window > sample_arr.size:
+        window = sample_arr.size
 
-    if len(sample) == 0:
-        return sample.copy()
+    kernel = np.ones(window, dtype=np.float32) / float(window)
+    smoothed = np.convolve(np.abs(sample_arr), kernel, mode="same")
+    peak = float(smoothed.max())
+    if peak <= 0:
+        return sample_arr.copy()
 
-    try:
-        _, rpeaks_info = nk.ecg_peaks(sample, sampling_rate=sampling_rate, method=peak_detection_method)
-        r_locs = rpeaks_info.get("ECG_R_Peaks", None)
-        if r_locs is None or len(r_locs) == 0:
-            return sample.copy()
+    threshold = peak * float(config.amplitude_ratio)
+    if threshold <= 0:
+        return sample_arr.copy()
 
-        _, delineate_info = nk.ecg_delineate(
-            sample,
-            rpeaks=rpeaks_info,
-            sampling_rate=sampling_rate,
-            method=delineate_method,
-        )
-        t_offsets = delineate_info.get("ECG_T_Offsets", None)
-        if t_offsets is None:
-            return sample.copy()
+    significant = np.flatnonzero(smoothed >= threshold)
+    if significant.size == 0:
+        return sample_arr.copy()
 
-        last_t_offset = _last_valid_index(t_offsets)
-        if last_t_offset is None:
-            return sample.copy()
+    last_idx = significant[-1] + int(config.pad)
+    cutoff = min(sample_arr.size, max(last_idx, significant[-1] + 1))
 
-        pad_samples = int(round((pad_ms / 1000.0) * sampling_rate))
-        cutoff_index = min(len(sample), last_t_offset + pad_samples)
-    except Exception:  # pragma: no cover - fall back to original when delineation fails
-        return sample.copy()
-
-    trimmed = sample.copy()
-    trimmed[cutoff_index:] = 0.0
+    trimmed = sample_arr.copy()
+    trimmed[cutoff:] = 0.0
     return trimmed
 
 
 def augment_sample(
     sample: np.ndarray,
-    sampling_rate: int,
     noise_config: GaussianNoiseConfig | None = None,
-    delineate_method: str = "dwt",
-    peak_detection_method: str = "neurokit",
-    pad_ms: float = 40.0,
+    tail_config: TailTrimmingConfig | None = None,
 ) -> np.ndarray:
-    """Apply Gaussian noise and tail removal augmentation to an ECG sample."""
+    """Apply MIT-BIH specific augmentations to a single heartbeat segment."""
 
-    trimmed = remove_post_pqrst_segment(
-        sample,
-        sampling_rate=sampling_rate,
-        delineate_method=delineate_method,
-        peak_detection_method=peak_detection_method,
-        pad_ms=pad_ms,
-    )
-
+    trimmed = remove_mitbih_tail(sample, config=tail_config)
     return add_gaussian_noise(trimmed, config=noise_config)
 
 
 def augment_batch(
     samples: np.ndarray,
-    sampling_rate: int,
     noise_config: GaussianNoiseConfig | None = None,
-    delineate_method: str = "dwt",
-    peak_detection_method: str = "neurokit",
-    pad_ms: float = 40.0,
+    tail_config: TailTrimmingConfig | None = None,
 ) -> np.ndarray:
-    """Vectorised augmentation for a batch of ECG samples."""
+    """Vectorised augmentation for a batch of MIT-BIH heartbeat segments."""
 
-    augmented_samples = np.empty_like(samples)
-    for idx, sample in enumerate(samples):
-        augmented_samples[idx] = augment_sample(
-            sample,
-            sampling_rate=sampling_rate,
-            noise_config=noise_config,
-            delineate_method=delineate_method,
-            peak_detection_method=peak_detection_method,
-            pad_ms=pad_ms,
+    samples_arr = np.asarray(samples, dtype=np.float32)
+    if samples_arr.ndim != 2:
+        raise ValueError("MIT-BIH heartbeat batches must be two-dimensional.")
+    if samples_arr.shape[1] != MITBIH_SAMPLE_LENGTH:
+        raise ValueError(
+            f"Expected MIT-BIH heartbeat length {MITBIH_SAMPLE_LENGTH}, received {samples_arr.shape[1]}."
         )
-    return augmented_samples
+
+    augmented = np.empty_like(samples_arr)
+    for idx, sample in enumerate(samples_arr):
+        augmented[idx] = augment_sample(sample, noise_config=noise_config, tail_config=tail_config)
+    return augmented
 
 
 __all__ = [
+    "MITBIH_SAMPLE_LENGTH",
+    "MITBIH_SAMPLING_RATE",
     "GaussianNoiseConfig",
+    "TailTrimmingConfig",
     "add_gaussian_noise",
-    "remove_post_pqrst_segment",
+    "remove_mitbih_tail",
     "augment_sample",
     "augment_batch",
 ]
